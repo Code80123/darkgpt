@@ -745,7 +745,6 @@
   }
   button#stopBtn:hover { background: var(--accent); color: #fff; }
 
-  /* Overlay API hors ligne */
   .offline-overlay {
     position: fixed; inset: 0;
     z-index: 5000;
@@ -1219,7 +1218,6 @@
   </div>
 </div>
 
-<!-- Overlay API hors ligne -->
 <div class="offline-overlay" id="offlineOverlay" role="alertdialog" aria-modal="true">
   <div class="offline-card">
     <div class="offline-icon">
@@ -1348,7 +1346,6 @@ let generationId = 0;
 let searchContext = "";
 let isOffline = false;
 let healthCheckTimer = null;
-let offlineOverlayLocked = false;
 
 function loadMessages() {
   try {
@@ -1813,14 +1810,10 @@ function makeThinking(initialPhase) {
 /* =========================================================
    DÉTECTION API HORS LIGNE
    ========================================================= */
-function getHealthURL() {
-  try {
-    const u = new URL(CONFIG.url);
-    u.pathname = u.pathname.replace(/\/chat\/?$/, "/");
-    return u.toString();
-  } catch {
-    return CONFIG.url.replace(/\/chat\/?$/, "/");
-  }
+function looksLikeBackendDown(status, body) {
+  if (status === 502 || status === 503 || status === 504 || status === 521 || status === 522 || status === 523) return true;
+  if (typeof body !== "string") return false;
+  return /<!DOCTYPE\s+html|<html[\s>]|Bad Gateway|Service Unavailable|Gateway Time-out|ngrok/i.test(body);
 }
 
 function setOfflineStatus(state, text) {
@@ -1831,7 +1824,6 @@ function setOfflineStatus(state, text) {
 }
 
 function showOfflineOverlay() {
-  if (offlineOverlayLocked) return;
   isOffline = true;
   document.body.classList.add("api-offline");
   offlineOverlay.classList.add("show");
@@ -1849,45 +1841,62 @@ function hideOfflineOverlay() {
 }
 
 async function checkAPIHealth(silent = true) {
-  if (!CONFIG.url) return;
-  const healthURL = getHealthURL();
+  if (!CONFIG.url) return false;
   setOfflineStatus("checking", "Vérification…");
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+  let res = null;
+  let bodyText = "";
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
-    let res;
-    try {
-      res = await fetch(healthURL, {
-        method: "GET",
-        signal: controller.signal,
-        cache: "no-store",
-        headers: { "X-Access-Code": CONFIG.apiKey || "" }
-      });
-    } catch (e) {
-      clearTimeout(timeout);
-      throw e;
-    }
-    clearTimeout(timeout);
-    if (res && (res.ok || res.status === 401 || res.status === 403 || res.status === 405)) {
-      if (isOffline) {
-        hideOfflineOverlay();
-        toast("API de nouveau en ligne ✓");
-        setOfflineStatus("online", "En ligne");
-      } else {
-        setOfflineStatus("online", "En ligne");
-      }
-      return true;
-    }
-    throw new Error("HTTP " + (res ? res.status : "?"));
+    res = await fetch(CONFIG.url, {
+      method: "POST",
+      signal: controller.signal,
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Access-Code": CONFIG.apiKey || ""
+      },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "ping" }],
+        max_tokens: 1,
+        stream: false
+      })
+    });
+    try { bodyText = await res.text(); } catch {}
   } catch (e) {
+    clearTimeout(timeout);
     console.warn("[DarkGPT] API injoignable :", e);
     if (!isOffline) {
       showOfflineOverlay();
       if (!silent) toast("API injoignable");
+    } else {
+      setOfflineStatus("offline", "Hors ligne — vérification auto toutes les 30 s");
     }
-    setOfflineStatus("offline", "Hors ligne — vérification auto toutes les 30 s");
     return false;
   }
+  clearTimeout(timeout);
+
+  const down = looksLikeBackendDown(res.status, bodyText);
+  const ct = (res.headers.get("content-type") || "").toLowerCase();
+  const htmlResponse = ct.includes("text/html");
+
+  if (!down && !htmlResponse) {
+    if (isOffline) {
+      hideOfflineOverlay();
+      toast("API de nouveau en ligne ✓");
+    }
+    setOfflineStatus("online", "En ligne");
+    return true;
+  }
+
+  console.warn("[DarkGPT] Backend down — HTTP", res.status, "content-type:", ct);
+  if (!isOffline) {
+    showOfflineOverlay();
+    if (!silent) toast("API hors ligne");
+  } else {
+    setOfflineStatus("offline", "Hors ligne — vérification auto toutes les 30 s");
+  }
+  return false;
 }
 
 function startHealthCheckLoop() {
@@ -2222,6 +2231,10 @@ async function sendMessage(text, opts = {}) {
     if (myGen !== generationId) return;
     if (!res.ok) {
       const msg = await readErrorBody(res);
+      if (looksLikeBackendDown(res.status, msg)) {
+        showOfflineOverlay();
+        throw new Error("API hors ligne (HTTP " + res.status + ")");
+      }
       throw new Error("HTTP " + res.status + " — " + msg);
     }
 
@@ -2336,7 +2349,7 @@ async function sendMessage(text, opts = {}) {
         currentIAEl.innerHTML = renderMarkdown(fullText) + errHTML;
         currentIAEl._row._content = fullText + "\n\n[Erreur] " + err.message;
       }
-      if (/HTTP 50[0-9]|Failed to fetch|NetworkError|Load failed/i.test(err.message)) {
+      if (/HTTP 5\d\d|Failed to fetch|NetworkError|Load failed|Bad Gateway|Service Unavailable|doctype html|API hors ligne/i.test(err.message)) {
         checkAPIHealth(false);
       }
     }
